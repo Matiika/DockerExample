@@ -1,0 +1,204 @@
+version: '3.8'
+
+services:
+  # Инфраструктурные сервисы
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.1
+    container_name: zookeeper-integration
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - integration-network
+
+  broker:
+    image: confluentinc/cp-kafka:7.5.1
+    container_name: broker-integration
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:9092
+      KAFKA_BROKER_ID: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - integration-network
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Eureka и Gateway
+  eureka-server:
+    build:
+      context: ./spring-micro-demo
+      target: eureka-server
+    container_name: eureka-server-integration
+    ports:
+      - "8081:8081"
+    networks:
+      - integration-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  config-server:
+    build:
+      context: ./spring-micro-demo
+      target: config-server
+    container_name: config-server-integration
+    ports:
+      - "8888:8888"
+    networks:
+      - integration-network
+    depends_on:
+      eureka-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  api-gateway:
+    build:
+      context: ./spring-micro-demo
+      target: api-gateway
+    container_name: api-gateway-integration
+    ports:
+      - "8082:8082"
+    networks:
+      - integration-network
+    depends_on:
+      eureka-server:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+    environment:
+      - EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE=http://eureka-server:8081/eureka
+      - SPRING_CLOUD_CONFIG_URI=http://config-server:8888
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Бизнес-сервисы
+  user-service:
+    build:
+      context: ./UserServiceApp
+      dockerfile: Dockerfile
+    container_name: user-service-integration
+    ports:
+      - "8080:8080"
+    depends_on:
+      broker:
+        condition: service_healthy
+      eureka-server:
+        condition: service_healthy
+    environment:
+      # Kafka настройки
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: broker:9092
+      
+      # Mail настройки
+      SPRING_MAIL_USERNAME: ${SPRING_MAIL_USERNAME}
+      SPRING_MAIL_PASSWORD: ${SPRING_MAIL_PASSWORD}
+      
+      # Eureka настройки - для интеграции
+      EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8081/eureka
+      
+      # Логирование
+      LOGGING_LEVEL_ROOT: INFO
+    networks:
+      - integration-network
+    restart: unless-stopped
+
+  eureka-client:
+    build:
+      context: ./spring-micro-demo
+      target: eureka-client
+    container_name: eureka-client-integration
+    ports:
+      - "8083:8083"
+    networks:
+      - integration-network
+    depends_on:
+      eureka-server:
+        condition: service_healthy
+    environment:
+      - EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE=http://eureka-server:8081/eureka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Сервис уведомлений
+  kafka-email-service:
+    build:
+      context: ./notificationKafka
+      dockerfile: Dockerfile
+    container_name: kafka-email-service-integration
+    ports:
+      - "8000:8000"
+    depends_on:
+      broker:
+        condition: service_healthy
+    environment:
+      # Kafka настройки
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: broker:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: notification-group
+      SPRING_KAFKA_CONSUMER_AUTO_OFFSET_RESET: earliest
+
+      # Mail настройки - ОБЯЗАТЕЛЬНО ЗАПОЛНИТЕ!
+      SPRING_MAIL_USERNAME: ${SPRING_MAIL_USERNAME}
+      SPRING_MAIL_PASSWORD: ${SPRING_MAIL_PASSWORD}
+      SPRING_MAIL_HOST: smtp.gmail.com
+      SPRING_MAIL_PORT: 587
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_AUTH: true
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE: true
+
+      # Настройки приложения
+      SPRING_APPLICATION_NAME: kafka-email-service
+      SERVER_PORT: 8000
+
+      # Профили Spring
+      SPRING_PROFILES_ACTIVE: docker
+
+      # Логирование
+      LOGGING_LEVEL_ROOT: INFO
+      LOGGING_LEVEL_ORG_APACHE_KAFKA: INFO
+      LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_KAFKA_LISTENER: DEBUG
+
+      # JPA настройки
+      SPRING_JPA_GENERATE_DDL: true
+      SPRING_JPA_SHOW_SQL: true
+
+      # Java опции
+      JAVA_OPTS: "-Xmx512m -Xms256m"
+
+    networks:
+      - integration-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+networks:
+  integration-network:
+    driver: bridge
